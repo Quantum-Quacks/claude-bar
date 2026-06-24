@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Don't issue a network call more often than this, however many events fire.
     private let minFetchSpacing: TimeInterval = 45
 
+    private let notifier = Notifier()
     private var statusItem: NSStatusItem!
     private var pollTimer: Timer?
     private var activityToken: NSObjectProtocol?
@@ -32,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
 
         accountEmail = UsageClient.accountEmail()
+        notifier.requestAuthorization()
         refresh(force: true)
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(didWake),
@@ -77,6 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case .success(let usage):
                 self.usage = usage
                 self.lastError = nil
+                self.notifier.evaluate(usage: usage, at: Date())
             case .failure(let error):
                 self.lastError = error   // keep last-good usage on screen
             }
@@ -122,6 +125,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             title: "Refresh Now", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
+
+        let notify = NSMenuItem(
+            title: "Notify Near Limits", action: #selector(toggleNotifications), keyEquivalent: "")
+        notify.target = self
+        notify.state = notifier.isEnabled ? .on : .off
+        menu.addItem(notify)
 
         if Bundle.main.bundleURL.pathExtension == "app" {
             let login = NSMenuItem(
@@ -184,6 +193,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func refreshNow() { refresh(force: true) }
+
+    @objc private func toggleNotifications() {
+        notifier.isEnabled.toggle()
+        if notifier.isEnabled { notifier.requestAuthorization() }
+    }
 
     @objc private func toggleLoginItem() {
         do {

@@ -25,6 +25,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isFetching = false
     private var lastDrawn: [Int?]?
 
+    private var accountUserID: String?
+
+    // Per-saved-account usage shown in the Accounts submenu, keyed by profile name.
+    private struct AccountUsage { var usage: Usage?; var error: UsageError?; var fetchedAt: Date }
+    private var accountUsage: [String: AccountUsage] = [:]
+    private var accountFetchInFlight: Set<String> = []
+    private var accountRowItems: [String: NSMenuItem] = [:]
+    private var accountRowInfo: [String: AccountStore.Listed] = [:]
+    private weak var accountsSubmenu: NSMenu?
+    /// Re-use a fetched figure for this long; back off longer after a failure so
+    /// a revoked token isn't poked repeatedly.
+    private let accountUsageTTL: TimeInterval = 120
+    private let accountErrorTTL: TimeInterval = 600
+
+    /// Decrypted access tokens kept in memory so the keychain is read at most
+    /// once per token lifetime instead of on every poll or menu open — that read
+    /// is what triggers the macOS permission prompt. Invalidated when the active
+    /// account changes or a token is rejected.
+    private struct CachedToken { let token: String; let plan: String?; let expiresAt: Date? }
+    private var liveToken: CachedToken?
+    private var liveTokenEmail: String?
+    private var profileTokens: [String: CachedToken] = [:]
+
+    private func isActiveAccount(_ account: AccountStore.Listed) -> Bool {
+        // Match on email only — that's the per-account identity. The `userID` in
+        // ~/.claude.json is a per-machine id shared by every account, so matching
+        // on it marks ALL saved accounts active and blocks switching.
+        guard let email = accountEmail, let other = account.email else { return false }
+        return email == other
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
@@ -33,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
 
         accountEmail = UsageClient.accountEmail()
+        accountUserID = AccountStore.activeUserID()
         notifier.requestAuthorization()
         refresh(force: true)
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -59,6 +91,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func didWake() {
         accountEmail = UsageClient.accountEmail()
+        accountUserID = AccountStore.activeUserID()
+        liveToken = nil   // token may have rotated while asleep; re-read once
         refresh(force: true)
     }
 
@@ -72,8 +106,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isFetching = true
         lastFetchStarted = Date()
         Task { [weak self] in
-            let result = await UsageClient.fetch()
             guard let self else { completion?(); return }
+            let result = await self.fetchLiveUsage()
             self.isFetching = false
             switch result {
             case .success(let usage):
@@ -86,6 +120,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.render()
             completion?()
         }
+    }
+
+    /// Usage for the active account, reading the keychain only when the cached
+    /// token is missing, near expiry, or rejected — so a steady poll doesn't
+    /// re-prompt every few minutes.
+    private func fetchLiveUsage() async -> Result<Usage, UsageError> {
+        let email = UsageClient.accountEmail()   // ~/.claude.json, no keychain
+        if liveTokenEmail != email { liveToken = nil; liveTokenEmail = email }
+
+        if let cached = liveToken, let expiry = cached.expiresAt,
+           expiry.timeIntervalSinceNow > 600 {
+            let result = await UsageClient.usage(accessToken: cached.token, plan: cached.plan)
+            if case .failure(.unauthorized) = result {
+                liveToken = nil          // died early — fall through and re-read
+            } else {
+                return result
+            }
+        }
+        guard let creds = UsageClient.liveCredentials() else { return .failure(.noToken) }
+        liveToken = CachedToken(token: creds.token, plan: creds.plan, expiresAt: creds.expiresAt)
+        return await UsageClient.usage(accessToken: creds.token, plan: creds.plan)
     }
 
     // MARK: - Rendering
@@ -104,10 +159,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Menu
 
     func menuWillOpen(_ menu: NSMenu) {
+        if menu === accountsSubmenu { return }
         refresh(force: false)   // exact read when you look, throttled
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === accountsSubmenu {
+            rebuildAccountsSubmenu(menu)
+            kickAccountUsageFetches()
+            return
+        }
         menu.removeAllItems()
         let now = Date()
 
@@ -119,6 +180,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(infoItem(label: "Session (5h)", window: usage?.fiveHour, now: now))
         menu.addItem(infoItem(label: "Weekly (7d)", window: usage?.sevenDay, now: now))
         menu.addItem(disabledItem(statusText(now: now)))
+
+        menu.addItem(.separator())
+        menu.addItem(accountsMenu())
 
         menu.addItem(.separator())
         let refreshItem = NSMenuItem(
@@ -197,6 +261,287 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleNotifications() {
         notifier.isEnabled.toggle()
         if notifier.isEnabled { notifier.requestAuthorization() }
+    }
+
+    // MARK: - Accounts
+
+    /// "Accounts" submenu: one row per saved profile (✓ on the active one) with
+    /// its live usage, plus "Save Current Account As…". Hold ⌥ to turn a row into
+    /// "Remove". Rows are filled in here; usage is fetched lazily when the
+    /// submenu opens (see menuNeedsUpdate).
+    private func accountsMenu() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Accounts", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.delegate = self
+        accountsSubmenu = submenu
+        parent.submenu = submenu
+        rebuildAccountsSubmenu(submenu)   // never show a blank submenu
+        return parent
+    }
+
+    private func rebuildAccountsSubmenu(_ submenu: NSMenu) {
+        submenu.removeAllItems()
+        accountRowItems.removeAll()
+        accountRowInfo.removeAll()
+        let saved = AccountStore.list()
+
+        if saved.isEmpty {
+            submenu.addItem(disabledItem("No saved accounts yet"))
+        } else {
+            for account in saved {
+                // Parent shows status (✓ + usage); its submenu holds the actions.
+                let parent = NSMenuItem(title: accountRowTitle(account), action: nil, keyEquivalent: "")
+                if isActiveAccount(account) { parent.state = .on }
+                parent.submenu = accountActionsMenu(for: account)
+                submenu.addItem(parent)
+                accountRowItems[account.name] = parent
+                accountRowInfo[account.name] = account
+            }
+        }
+
+        submenu.addItem(.separator())
+        let save = NSMenuItem(
+            title: "Save Current Account As…",
+            action: #selector(saveCurrentAccount), keyEquivalent: "")
+        save.target = self
+        submenu.addItem(save)
+    }
+
+    /// Per-account action submenu: switch to it, rename it, or delete it.
+    private func accountActionsMenu(for account: AccountStore.Listed) -> NSMenu {
+        let menu = NSMenu()
+        if isActiveAccount(account) {
+            menu.addItem(disabledItem("Cuenta activa"))
+        } else {
+            let use = NSMenuItem(
+                title: "Usar esta cuenta", action: #selector(switchAccount(_:)), keyEquivalent: "")
+            use.target = self
+            use.representedObject = account.name
+            menu.addItem(use)
+        }
+        menu.addItem(.separator())
+        let rename = NSMenuItem(
+            title: "Renombrar…", action: #selector(renameAccount(_:)), keyEquivalent: "")
+        rename.target = self
+        rename.representedObject = account.name
+        menu.addItem(rename)
+        let remove = NSMenuItem(
+            title: "Eliminar", action: #selector(removeAccount(_:)), keyEquivalent: "")
+        remove.target = self
+        remove.representedObject = account.name
+        menu.addItem(remove)
+        return menu
+    }
+
+    private func accountDisplay(_ account: AccountStore.Listed) -> String {
+        var title = account.name
+        if let email = account.email, email != account.name { title += " · \(email)" }
+        if let plan = account.plan, !plan.isEmpty { title += " (\(plan.capitalized))" }
+        return title
+    }
+
+    private func accountRowTitle(_ account: AccountStore.Listed) -> String {
+        var title = accountDisplay(account)
+        if let usageText = accountUsageText(for: account) { title += "  —  \(usageText)" }
+        return title
+    }
+
+    /// Usage suffix for an account row: the live figure for the active account,
+    /// the cached/refreshed figure otherwise, or a short status while loading or
+    /// after a failure.
+    private func accountUsageText(for account: AccountStore.Listed) -> String? {
+        if isActiveAccount(account) {
+            return usage.map { usageSummary($0) } ?? "…"
+        }
+        if accountUsage[account.name] == nil, accountFetchInFlight.contains(account.name) {
+            return "…"
+        }
+        guard let entry = accountUsage[account.name] else { return nil }
+        if let usage = entry.usage { return usageSummary(usage) }
+        switch entry.error {
+        case .unauthorized, .noToken: return "sesión expirada · re-login"
+        case .rateLimited: return "rate limited"
+        default: return "sin conexión"
+        }
+    }
+
+    private func usageSummary(_ usage: Usage) -> String {
+        let now = Date()
+        var parts: [String] = []
+        if let pct = usage.fiveHour?.effectivePercentage(at: now) {
+            var text = String(format: "5h %.0f%%", pct)
+            if let resets = usage.fiveHour?.resetsAt, resets > now {
+                text += " (→\(resetDescription(resets, now: now)))"   // sesión 5h activa
+            }
+            parts.append(text)
+        }
+        if let pct = usage.sevenDay?.effectivePercentage(at: now) {
+            parts.append(String(format: "7d %.0f%%", pct))
+        }
+        return parts.isEmpty ? "sin datos" : parts.joined(separator: " · ")
+    }
+
+    private func kickAccountUsageFetches() {
+        for account in accountRowInfo.values { triggerAccountUsageFetch(account) }
+    }
+
+    /// Refresh-and-fetch usage for one saved account, throttled by TTL and
+    /// deduped by an in-flight set. Skips the active account (it shows live).
+    private func triggerAccountUsageFetch(_ account: AccountStore.Listed) {
+        if isActiveAccount(account) { return }
+        let name = account.name
+        if accountFetchInFlight.contains(name) { return }
+        if let entry = accountUsage[name] {
+            let ttl = entry.error == nil ? accountUsageTTL : accountErrorTTL
+            if Date().timeIntervalSince(entry.fetchedAt) < ttl { return }
+        }
+        accountFetchInFlight.insert(name)
+        Task { [weak self] in
+            guard let self else { return }
+            // Reuse an in-memory token while it's valid — no keychain, no prompt.
+            var creds: (token: String, plan: String?)?
+            if let cached = self.profileTokens[name], let expiry = cached.expiresAt,
+               expiry.timeIntervalSinceNow > 600 {
+                creds = (cached.token, cached.plan)
+            } else if let fresh = await AccountStore.freshAccessToken(for: name) {
+                self.profileTokens[name] = CachedToken(
+                    token: fresh.token, plan: fresh.plan, expiresAt: fresh.expiresAt)
+                creds = (fresh.token, fresh.plan)
+            }
+
+            let entry: AccountUsage
+            if let creds {
+                switch await UsageClient.usage(accessToken: creds.token, plan: creds.plan) {
+                case .success(let usage):
+                    entry = AccountUsage(usage: usage, error: nil, fetchedAt: Date())
+                case .failure(let error):
+                    if case .unauthorized = error { self.profileTokens[name] = nil }
+                    entry = AccountUsage(usage: nil, error: error, fetchedAt: Date())
+                }
+            } else {
+                entry = AccountUsage(usage: nil, error: .unauthorized, fetchedAt: Date())
+            }
+            self.accountFetchInFlight.remove(name)
+            self.accountUsage[name] = entry
+            self.updateAccountRow(name)
+        }
+    }
+
+    /// Update one row's title in place (no rebuild) when its usage lands.
+    private func updateAccountRow(_ name: String) {
+        guard let item = accountRowItems[name], let info = accountRowInfo[name] else { return }
+        item.title = accountRowTitle(info)
+    }
+
+    @objc private func switchAccount(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        do {
+            try AccountStore.activate(name)
+            accountEmail = UsageClient.accountEmail()
+            accountUserID = AccountStore.activeUserID()
+            liveToken = nil           // active token changed — re-read on next poll
+            notifier.reset()          // new account, fresh thresholds
+            usage = nil               // drop the old account's bars until the refetch lands
+            render()
+            refresh(force: true)
+        } catch {
+            presentError("Couldn’t switch account", error)
+        }
+    }
+
+    @objc private func saveCurrentAccount() {
+        guard let name = promptForAccountName() else { return }
+        do {
+            try AccountStore.saveCurrent(as: name)
+        } catch {
+            presentError("Couldn’t save account", error)
+        }
+    }
+
+    @objc private func removeAccount(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "¿Eliminar la cuenta guardada “\(name)”?"
+        alert.informativeText = "Se borra el perfil guardado. No afecta a la sesión de Claude Code activa."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Eliminar")
+        alert.addButton(withTitle: "Cancelar")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        AccountStore.remove(name)
+        forgetAccountCaches(name)
+    }
+
+    @objc private func renameAccount(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        guard let newName = promptForName(
+            title: "Renombrar cuenta",
+            message: "Nuevo nombre para “\(name)”.",
+            initial: name), newName != name
+        else { return }
+        do {
+            try AccountStore.rename(name, to: newName)
+            if let usage = accountUsage.removeValue(forKey: name) { accountUsage[newName] = usage }
+            if let token = profileTokens.removeValue(forKey: name) { profileTokens[newName] = token }
+            accountFetchInFlight.remove(name)
+        } catch {
+            presentError("No se pudo renombrar", error)
+        }
+    }
+
+    /// Drop any in-memory state for a profile that's been removed/renamed.
+    private func forgetAccountCaches(_ name: String) {
+        accountUsage[name] = nil
+        profileTokens[name] = nil
+        accountFetchInFlight.remove(name)
+    }
+
+    /// Modal text prompt seeded with `initial`; nil if cancelled or left empty.
+    private func promptForName(title: String, message: String, initial: String) -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "Guardar")
+        alert.addButton(withTitle: "Cancelar")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = initial
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    /// Modal name prompt, pre-filled with the active account's email local-part.
+    private func promptForAccountName() -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Save current Claude account"
+        alert.informativeText = "Name this profile so you can switch back to it later."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.placeholderString = "e.g. work, personal"
+        if let email = accountEmail {
+            field.stringValue = String(email.prefix(while: { $0 != "@" }))
+        }
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    private func presentError(_ title: String, _ error: Error) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = error.localizedDescription
+        alert.alertStyle = .warning
+        alert.runModal()
     }
 
     @objc private func toggleLoginItem() {

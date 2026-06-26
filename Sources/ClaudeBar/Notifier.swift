@@ -33,6 +33,10 @@ final class Notifier {
         }
     }
 
+    /// Forget all per-window crossing state. Call when the active account
+    /// changes so the next account's usage is judged from a clean slate.
+    func reset() { announced.removeAll() }
+
     /// Run after every successful fetch. Always updates the per-window state so
     /// toggling notifications on later won't replay stale crossings.
     func evaluate(usage: Usage, at now: Date) {

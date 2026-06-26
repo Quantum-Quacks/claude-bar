@@ -25,6 +25,39 @@ macOS will ask once for permission to read the `Claude Code-credentials`
 keychain item. Click **Always Allow** and it won't ask again. You must have
 logged into Claude Code at least once.
 
+## Notifications
+
+Claude Bar can tell you when you're getting close to a limit so you don't have
+to keep opening the menu. It posts a local notification the first time a window
+(Session or Weekly) crosses **70% / 90% / 100%** on the way up, and once more
+when that window resets back to zero. It remembers the highest level it already
+announced for each window, so a meter parked at 72% won't re-notify on every
+poll — only a real new crossing speaks up. Toggle it from **Notify Near Limits**
+in the menu (on by default); macOS asks for notification permission once.
+
+## Switching accounts
+
+Have more than one Claude login (personal, work, a second Max seat)? The
+**Accounts** submenu saves and swaps between them:
+
+- **Save Current Account As…** snapshots the active login — the OAuth blob from
+  the keychain plus the `oauthAccount`/`userID` identity from `~/.claude.json` —
+  under a name you choose. Profiles are stored in the keychain (one item per
+  name under service `ClaudeBar-account`), so refresh tokens never hit disk in
+  the clear.
+- **Click a saved account** to make it active: Claude Bar rewrites the live
+  `Claude Code-credentials` keychain item and patches `~/.claude.json` in one
+  go. The meter re-reads the new account on its next poll.
+- **Hold ⌥** over a saved account to turn the row into **Remove**.
+
+What this can and can't do: any `claude` session you start *after* switching uses
+the new account immediately. Sessions **already running keep the token they
+cached in memory** — Claude Code reads credentials at startup and doesn't re-read
+the keychain mid-session, so a live process won't switch out from under itself.
+To move a running session to the new account, restart it (or run `/login` inside
+it). There is no supported way to hot-swap the login of a process that's already
+running.
+
 ## Good citizen
 
 Refreshing is deliberately lazy and power-friendly:

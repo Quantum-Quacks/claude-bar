@@ -90,9 +90,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func didWake() {
-        accountEmail = UsageClient.accountEmail()
-        accountUserID = AccountStore.activeUserID()
-        liveToken = nil   // token may have rotated while asleep; re-read once
+        // Only overwrite identity when the read succeeds — ~/.claude.json is
+        // rewritten constantly by Claude Code, so a wake that lands mid-rewrite
+        // would otherwise blank these out.
+        if let email = UsageClient.accountEmail() { accountEmail = email }
+        if let userID = AccountStore.activeUserID() { accountUserID = userID }
+        // Keep the cached token across sleep. A rotation by Claude Code while we
+        // slept does NOT invalidate the access token we already hold (it stays
+        // valid until its own expiry), and a genuinely rejected token re-reads
+        // via the .unauthorized path below. Clearing it here forced a keychain
+        // read — and a macOS permission prompt — on every single wake.
         refresh(force: true)
     }
 
@@ -126,8 +133,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// token is missing, near expiry, or rejected — so a steady poll doesn't
     /// re-prompt every few minutes.
     private func fetchLiveUsage() async -> Result<Usage, UsageError> {
-        let email = UsageClient.accountEmail()   // ~/.claude.json, no keychain
-        if liveTokenEmail != email { liveToken = nil; liveTokenEmail = email }
+        // Drop the cached token only when the active account genuinely changes —
+        // i.e. a *different, known* email. accountEmail() reads ~/.claude.json,
+        // which Claude Code rewrites constantly; a nil here means we caught it
+        // mid-rewrite, not that the account changed. Treating that nil as a
+        // change is what discarded a good token and forced a fresh keychain read
+        // (a permission prompt) on the next poll or menu open.
+        if let email = UsageClient.accountEmail(), liveTokenEmail != email {
+            liveToken = nil
+            liveTokenEmail = email
+        }
 
         if let cached = liveToken, let expiry = cached.expiresAt,
            expiry.timeIntervalSinceNow > 600 {

@@ -153,8 +153,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return result
             }
         }
+
+        // Our own persisted copy, written after a previous bootstrap. Reading it
+        // never prompts (we own the item), so a restart reuses it instead of
+        // re-reading Claude Code's item — the read that triggers the prompt.
+        if liveToken == nil,
+           let saved = UsageClient.cachedLiveCredentials(forEmail: liveTokenEmail),
+           let expiry = saved.expiresAt, expiry.timeIntervalSinceNow > 600 {
+            let result = await UsageClient.usage(accessToken: saved.token, plan: saved.plan)
+            if case .failure(.unauthorized) = result {
+                UsageClient.clearCachedLiveCredentials()   // stale — fall through
+            } else {
+                liveToken = CachedToken(
+                    token: saved.token, plan: saved.plan, expiresAt: saved.expiresAt)
+                return result
+            }
+        }
+
+        // Bootstrap: read Claude Code's item (the one prompt) and stash our own
+        // copy so the next launch doesn't have to.
         guard let creds = UsageClient.liveCredentials() else { return .failure(.noToken) }
         liveToken = CachedToken(token: creds.token, plan: creds.plan, expiresAt: creds.expiresAt)
+        UsageClient.storeLiveCredentials(
+            token: creds.token, plan: creds.plan,
+            expiresAt: creds.expiresAt, email: liveTokenEmail)
         return await UsageClient.usage(accessToken: creds.token, plan: creds.plan)
     }
 
@@ -455,6 +477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             accountEmail = UsageClient.accountEmail()
             accountUserID = AccountStore.activeUserID()
             liveToken = nil           // active token changed — re-read on next poll
+            UsageClient.clearCachedLiveCredentials()   // drop the old login's copy
             notifier.reset()          // new account, fresh thresholds
             usage = nil               // drop the old account's bars until the refetch lands
             render()
